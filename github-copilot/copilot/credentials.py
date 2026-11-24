@@ -211,6 +211,10 @@ _exchange_failure_cache: dict[str, float] = {}
 # the ONE in-flight exchange instead of each spawning a hung resolver thread during a DNS outage.
 _exchange_locks: dict[str, threading.Lock] = {}
 _exchange_locks_guard = threading.Lock()
+# Callers that have looked a lock up and not yet released it (waiting or holding). ``locked()``
+# alone misses a caller between lookup and acquire and a queued waiter, so pruning such an entry
+# would hand the next lookup a second Lock for the same token (#107).
+_exchange_lock_leases: dict[str, int] = {}
 
 # Bound the three per-token tables (#51). A rotated-away token's fingerprint is never presented
 # again, so its entries would otherwise live for the process lifetime: the JWT (including the
@@ -236,7 +240,7 @@ def _prune_exchange_caches() -> None:
                 break
             # A held lock is an exchange in flight: dropping it would let the next caller start a
             # second, concurrent exchange for the same token (single-flight broken).
-            if fp not in keep and not lock.locked():
+            if fp not in keep and not lock.locked() and not _exchange_lock_leases.get(fp):
                 _exchange_locks.pop(fp, None)
 
 
@@ -247,6 +251,30 @@ def _exchange_lock_for(fp: str) -> threading.Lock:
         if lock is None:
             lock = _exchange_locks[fp] = threading.Lock()
         return lock
+
+
+@contextlib.contextmanager
+def _exchange_lock_lease(fp: str):
+    """Look up the fingerprint's lock and keep its table entry alive until the caller is done.
+
+    The lease is taken under the table guard in the same step as the lookup, so pruning can never
+    drop the entry while this caller is about to acquire, is waiting on, or holds the lock.
+    """
+    _prune_exchange_caches()
+    with _exchange_locks_guard:
+        lock = _exchange_locks.get(fp)
+        if lock is None:
+            lock = _exchange_locks[fp] = threading.Lock()
+        _exchange_lock_leases[fp] = _exchange_lock_leases.get(fp, 0) + 1
+    try:
+        yield lock
+    finally:
+        with _exchange_locks_guard:
+            left = _exchange_lock_leases.get(fp, 1) - 1
+            if left > 0:
+                _exchange_lock_leases[fp] = left
+            else:
+                _exchange_lock_leases.pop(fp, None)
 
 
 _EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS = 60.0     # network blips: retry soon
@@ -445,7 +473,7 @@ def exchange_copilot_token(
                          f"for another {int(_fail_until - time.time())}s")
     # Note: a waiter's own ``timeout`` is not honoured across the lock wait — by design of
     # single-flight, it observes the holder's outcome instead.
-    with _exchange_lock_for(fp):
+    with _exchange_lock_lease(fp) as lock, lock:
         return _exchange_copilot_token_locked(raw_token, fp, timeout=timeout)
 
 
