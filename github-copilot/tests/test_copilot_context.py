@@ -80,7 +80,7 @@ class TestGetCopilotModelContext:
         assert mock_fetch.call_count == 1
 
         # Expire the cache
-        mod._copilot_context_cache_time = time.time() - 7200
+        mod._copilot_context_cache_time = time.monotonic() - 7200
         get_copilot_model_context("gpt-4.1")
         assert mock_fetch.call_count == 2
 
